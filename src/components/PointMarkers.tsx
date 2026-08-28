@@ -85,10 +85,13 @@ interface PointMarkersProps {
   capturedStageIndex: number
   view: Side
   selectedName: string | null
+  selectedStageId: string | null
   /** 是否显示据点与防线图层（区域多边形 + 标识） */
   visible: boolean
   /** 是否显示据点标识（A点图标 + "据点A"字样）；false 时仅隐藏标识，区域多边形保留 */
   labelsVisible: boolean
+  /** 是否显示据点图标下方的名称文字。 */
+  annotationsVisible: boolean
   /** 是否显示据点可占领区域。 */
   captureVisible: boolean
   /** 是否显示据点所在阶段防线。 */
@@ -105,8 +108,10 @@ export default function PointMarkers({
   capturedStageIndex,
   view,
   selectedName,
+  selectedStageId,
   visible,
   labelsVisible,
+  annotationsVisible,
   captureVisible,
   frontlineVisible,
   interactive,
@@ -132,7 +137,7 @@ export default function PointMarkers({
         <div class="${cls}" style="--c:${color}">
           ${showProgress && progress > 0 ? `<svg class="cap-progress-frame" viewBox="0 0 44 44" aria-hidden="true"><polyline class="value" points="${progressPoints}" style="--progress-color:${progressColor}"/></svg>` : ''}
           <img src="${img}" draggable="false" />
-          <span class="cap-tag">${point.name}</span>
+          ${annotationsVisible ? `<span class="cap-tag">${point.name}</span>` : ''}
         </div>`,
       iconSize: [44, 52],
       iconAnchor: [22, 42],
@@ -192,7 +197,7 @@ export default function PointMarkers({
             <Marker
               key={`pt-${activeStage.id}-${point.name}`}
               position={[point.lat, point.lng]}
-              icon={makeIcon(point, activeStatus, selectedName === point.name)}
+              icon={makeIcon(point, activeStatus, selectedStageId === activeStage.id && selectedName === point.name)}
               // 绘制工具激活时禁用交互：据点图标不拦截 mousedown，绘制可穿过
               interactive={interactive}
               eventHandlers={{

@@ -281,14 +281,14 @@ export interface GameModeProfile {
   name: string
   description: string
   maps: Record<string, ModeMapOverride>
-  /** 攻防模式按游戏数据端分别保存；其他模式继续使用 maps。 */
+  /** 支持双数据端的模式按 PC / PE（移动端游戏数据）分别保存；maps 保持为 PC 兼容别名。 */
   platformMaps?: Partial<Record<'pc' | 'mobile', Record<string, ModeMapOverride>>>
   createdAt: number
   updatedAt: number
 }
 
 export interface ModeConfigStore {
-  version: 25
+  version: 34
   activeModeId: string
   profiles: GameModeProfile[]
 }
@@ -377,14 +377,22 @@ export interface TextAnnotation {
   lng: number
 }
 
-/** 进行中的文字标注编辑会话（由地图图层发起，UI 面板消费） */
+/** 进行中的文字标注编辑会话（由地图图层发起，原位编辑器消费） */
 export interface ActiveTextEdit {
+  /** 唯一编辑会话编号；所有异步回调必须校验该编号，避免旧会话清理新会话。 */
+  sessionId: number
   uid: string
   lat: number
   lng: number
   initialText: string
   commit: (text: string) => void
   cancel: () => void
+  /** 幂等释放原位编辑器拥有的 DOM、事件监听及地图状态。 */
+  dispose: () => void
+  /** 重复请求编辑同一文本时只恢复焦点，不创建第二套编辑器。 */
+  focus?: () => void
+  /** 原位编辑器读取当前文本，避免使用独立浮层输入框。 */
+  getText?: () => string
   /** 地图容器内的像素坐标（第十三轮：文字编辑器跟随标注位置显示） */
   containerPoint?: { x: number; y: number }
 }
@@ -777,11 +785,15 @@ export interface LayerVisibility {
   points: boolean
   /** 据点标识（A点图标 + "据点A"字样），可与据点区域分离隐藏 */
   pointsLabels: boolean
+  /** 据点图标下方的名称文字。 */
+  pointAnnotations: boolean
   /** 据点自身的可占领区域。 */
   pointsCapture: boolean
   /** 据点当前所在阶段的防线区域。 */
   pointsFrontline: boolean
   spawns: boolean
+  /** 复活点图标下方的名称文字。 */
+  spawnAnnotations: boolean
   zones: boolean
   /** 胜者为王的条件式载具刷新位置。 */
   vehicleRefresh: boolean
@@ -808,6 +820,8 @@ export interface PersistedAppState {
     legendOpen: boolean
     /** 左侧栏宽度：250px 最小，默认 300px，最大 440px。 */
     leftPanelWidth: number
+    /** Android 官方地图图标视觉比例；触控热区不随之缩放。 */
+    mapMarkerScale: number
     layers: LayerVisibility
     propVis: PropVisibility
     /** 画笔工具设置（问题4：颜色/线宽/线型） */

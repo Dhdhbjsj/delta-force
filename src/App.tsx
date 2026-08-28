@@ -52,6 +52,7 @@ import {
   buildOfficialModeData,
   emptyModeMapOverride,
   loadModeConfigStore,
+  modeMapsForPlatform,
   normalizeModeConfigStore,
   saveModeConfigStore,
 } from './utils/modeConfigStorage'
@@ -93,6 +94,7 @@ function normalizeObjectivesForStageChange(
 ): MapState {
   const currentWargame = wargameOf(state)
   const objectiveStates = { ...currentWargame.battleContext.objectiveStates }
+  const activeObjectiveNames = new Set((stageList[toIndex]?.points ?? []).map((point) => point.name))
   if (toIndex > fromIndex) {
     for (let stageIndex = Math.max(0, fromIndex); stageIndex < toIndex; stageIndex += 1) {
       for (const point of stageList[stageIndex]?.points ?? []) {
@@ -105,6 +107,8 @@ function normalizeObjectivesForStageChange(
   }
   for (let stageIndex = toIndex + 1; stageIndex < stageList.length; stageIndex += 1) {
     for (const point of stageList[stageIndex]?.points ?? []) {
+      // 相邻阶段可能沿用同名据点；当前阶段状态必须优先，不能被后续阶段覆盖。
+      if (activeObjectiveNames.has(point.name)) continue
       objectiveStates[point.name] = { owner: 'defense', capturingSide: null, progress: 100 }
     }
   }
@@ -115,6 +119,60 @@ function normalizeObjectivesForStageChange(
       battleContext: { ...currentWargame.battleContext, objectiveStates },
     },
   }
+}
+
+/**
+ * 阶段切换的名单兜底：目标桶缺失时使用当前桶名单作为初始副本；
+ * 之后名单、部署位置、状态和枪线均按“阶段×回合”桶独立编辑。
+ * A 进图初始化 / B 模式阶段切换 / C 地图点据点 / D 点位面板 四处共用。
+ */
+function buildStageTargetRoster(state: MapState): Record<Side, OperatorUnit[]> {
+  const resetForStage = (operator: OperatorUnit): OperatorUnit => ({
+    uid: operator.uid,
+    name: operator.name,
+    side: operator.side,
+    team: operator.team,
+    operatorId: operator.operatorId,
+    cls: operator.cls,
+    status: 'alive',
+    lat: null,
+    lng: null,
+  })
+  return {
+    attack: operatorsBucketOf(state).attack.map(resetForStage),
+    defense: operatorsBucketOf(state).defense.map(resetForStage),
+  }
+}
+
+function resolveStageTargetBucket(
+  state: MapState,
+  existingTarget: TacticalBucket | undefined,
+  stageId: string,
+  round: number,
+): TacticalBucket {
+  const fallbackRoster = buildStageTargetRoster(state)
+  const emptyTarget = createEmptyMapState()
+  emptyTarget.operators = fallbackRoster
+  const targetBase = existingTarget ?? snapshotTacticalBucket(emptyTarget, stageId, round)
+  return {
+    ...targetBase,
+    operators: {
+      attack: targetBase.operators.attack.length ? targetBase.operators.attack : fallbackRoster.attack,
+      defense: targetBase.operators.defense.length ? targetBase.operators.defense : fallbackRoster.defense,
+    },
+  }
+}
+
+/** 经典攻防（非模式）切阶段：保存当前阶段桶、加载目标阶段桶（含名单初始兜底）、同步据点归属。 */
+function switchClassicStage(state: MapState, stageList: Array<{ id: string; points: CapturePoint[] }>, fromIndex: number, toIndex: number): MapState {
+  const fromStage = stageList[fromIndex]?.id ?? 'S1'
+  const toStage = stageList[toIndex]?.id ?? fromStage
+  const source = snapshotTacticalBucket(state, fromStage, wargameOf(state).round)
+  const buckets = { ...(state.tacticalBuckets?.buckets ?? {}), [source.key]: source }
+  const target = resolveStageTargetBucket(state, buckets[tacticalBucketKey(toStage, wargameOf(state).round)], toStage, wargameOf(state).round)
+  buckets[target.key] = target
+  const staged = normalizeObjectivesForStageChange({ ...state, tacticalBuckets: { activeKey: source.key, buckets } }, stageList, fromIndex, toIndex)
+  return applyTacticalBucket({ ...staged, tacticalBuckets: { activeKey: target.key, buckets } }, target)
 }
 
 /** 将分支路线首点递归吸附到父路线节点；父节点删除时自动夹取到仍存在的最近节点。 */
@@ -227,6 +285,11 @@ export default function App() {
   )
   const [view, setView] = useState<Side>(isCinematicObjectiveStates ? 'attack' : persisted?.lastView ?? 'attack')
   const [tool, setTool] = useState<ToolMode>('pan')
+  const [textEditing, setTextEditing] = useState(false)
+  const handleToolChange = useCallback((next: ToolMode) => {
+    if (textEditing) return
+    setTool(next)
+  }, [textEditing])
   const [maps, setMaps] = useState<MapsData>(() => {
     const base: MapsData = {}
     if (persisted?.maps) {
@@ -349,13 +412,18 @@ export default function App() {
     panelOpen: isCinematicRefreshSidebar ? false : isCinematicObjectiveStates || isCinematicActionSequence || device.mobileLayout || isCinematicMapOnly || isCinematicMobileFrame || cinematicLayoutPreset === 'winnerA' || cinematicLayoutPreset === 'platformCompare' || cinematicLayoutPreset === 'backdrop' ? false : persisted?.ui?.panelOpen ?? true,
     legendOpen: isCinematicObjectiveStates || device.mobileLayout || isCinematicMapOnly || Boolean(cinematicDefenseDemo) || cinematicLayoutPreset === 'backdrop' ? false : persisted?.ui?.legendOpen ?? true,
     leftPanelWidth: Math.max(300, Math.min(440, persisted?.ui?.leftPanelWidth ?? 300)),
+    mapMarkerScale: typeof persisted?.ui?.mapMarkerScale === 'number'
+      ? Math.max(0.65, Math.min(1.1, persisted.ui.mapMarkerScale))
+      : 0.9,
     layers: {
       props: cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.props ?? true,
       points: isCinematicObjectiveStates || cinematicLayoutPreset === 'platformCompare' ? true : cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.points ?? true,
       pointsLabels: isCinematicObjectiveStates || cinematicLayoutPreset === 'platformCompare' ? true : cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.pointsLabels ?? true,
+      pointAnnotations: cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.pointAnnotations ?? true,
       pointsCapture: isCinematicObjectiveStates || cinematicLayoutPreset === 'platformCompare' ? true : cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.pointsCapture ?? true,
       pointsFrontline: isCinematicObjectiveStates || cinematicLayoutPreset === 'platformCompare' ? true : cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.pointsFrontline ?? true,
       spawns: cinematicLayoutPreset === 'platformCompare' ? true : cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.spawns ?? true,
+      spawnAnnotations: cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.spawnAnnotations ?? true,
       zones: cinematicLayoutPreset === 'platformCompare' ? true : cinematicLayoutPreset === 'backdrop' || isCinematicMobileFrame ? false : persisted?.ui?.layers?.zones ?? true,
       vehicleRefresh: persisted?.ui?.layers?.vehicleRefresh ?? true,
     } as LayerVisibility,
@@ -413,8 +481,7 @@ export default function App() {
   const capturedStageIndex = Math.min(progress[activeTacticalContextKey] ?? 0, Math.max(0, stages.length - 1))
   const activeModeMap = useMemo(
     () => activeModeProfile
-      ? (activeModeProfile.id === 'attack-defense' ? activeModeProfile.platformMaps?.[gameDataPlatform] : activeModeProfile.maps)?.[mapId]
-        ?? activeModeProfile.maps[mapId]
+      ? modeMapsForPlatform(activeModeProfile, gameDataPlatform)[mapId]
         ?? emptyModeMapOverride(mapId)
       : null,
     [activeModeProfile, gameDataPlatform, mapId],
@@ -468,19 +535,7 @@ export default function App() {
       }
       const existingTarget = buckets[tacticalBucketKey(firstStageId, 1)]
         ?? Object.values(buckets).filter((bucket) => bucket.stageId === firstStageId).sort((a, b) => a.round - b.round)[0]
-      const emptyTarget = createEmptyMapState()
-      emptyTarget.operators = {
-        attack: operatorsBucketOf(state).attack.map((operator) => ({ ...structuredClone(operator), lat: null, lng: null })),
-        defense: operatorsBucketOf(state).defense.map((operator) => ({ ...structuredClone(operator), lat: null, lng: null })),
-      }
-      const targetBase = existingTarget ?? snapshotTacticalBucket(emptyTarget, firstStageId, 1)
-      const target = {
-        ...targetBase,
-        operators: {
-          attack: targetBase.operators.attack.length ? targetBase.operators.attack : emptyTarget.operators.attack,
-          defense: targetBase.operators.defense.length ? targetBase.operators.defense : emptyTarget.operators.defense,
-        },
-      }
+      const target = resolveStageTargetBucket(state, existingTarget, firstStageId, 1)
       buckets[target.key] = target
       const normalized = normalizeObjectivesForStageChange({ ...state, tacticalBuckets: { activeKey: target.key, buckets } }, entryStages, 0, 0)
       return { ...current, [entryKey]: applyTacticalBucket({ ...normalized, tacticalBuckets: { activeKey: target.key, buckets } }, target) }
@@ -504,19 +559,7 @@ export default function App() {
         const currentRoundKey = tacticalBucketKey(targetStage, wargameOf(state).round)
         const existingTarget = stored[currentRoundKey]
           ?? Object.values(stored).filter((bucket) => bucket.stageId === targetStage).sort((a, b) => a.round - b.round)[0]
-        const emptyTarget = createEmptyMapState()
-        emptyTarget.operators = {
-          attack: operatorsBucketOf(state).attack.map((operator) => ({ ...structuredClone(operator), lat: null, lng: null })),
-          defense: operatorsBucketOf(state).defense.map((operator) => ({ ...structuredClone(operator), lat: null, lng: null })),
-        }
-        const targetBase = existingTarget ?? snapshotTacticalBucket(emptyTarget, targetStage, 1)
-        const target = {
-          ...targetBase,
-          operators: {
-            attack: targetBase.operators.attack.length ? targetBase.operators.attack : emptyTarget.operators.attack,
-            defense: targetBase.operators.defense.length ? targetBase.operators.defense : emptyTarget.operators.defense,
-          },
-        }
+        const target = resolveStageTargetBucket(state, existingTarget, targetStage, 1)
         stored[target.key] = target
         const staged = { ...normalizeObjectivesForStageChange({ ...state, tacticalBuckets: { activeKey: sourceBucket.key, buckets: stored } }, activeOfficialModeMap?.stages ?? [], fromIndex, toIndex), tacticalBuckets: { activeKey: sourceBucket.key, buckets: stored } }
         return { ...current, [activeTacticalContextKey]: applyTacticalBucket({ ...staged, tacticalBuckets: { activeKey: target.key, buckets: stored } }, target) }
@@ -527,14 +570,14 @@ export default function App() {
     setDeployTarget(null)
   }, [activeModeMap, activeModeStageId, activeOfficialModeMap, activeTacticalContextKey, modeStageKey])
 
-  const updateMap = useCallback((_id: string, fn: (s: MapState) => MapState) => {
+  const updateMap = useCallback((_id: string, fn: (s: MapState) => MapState, syncStageId?: string) => {
     setMaps((prev) => {
       const storageKey = activeTacticalContextKeyRef.current
       const before = prev[storageKey] ?? createEmptyTacticalContextState()
       const next = fn(before)
       // 每次正式状态提交都同步当前阶段/回合桶。拖动预览仍由 Leaflet
       // 直接处理，只有 dragend 等正式提交会进入这里。
-      const synced = syncActiveTacticalBucket(next, activeModeStageId ?? stages[capturedStageIndex]?.id ?? 'S1')
+      const synced = syncActiveTacticalBucket(next, syncStageId ?? activeModeStageId ?? stages[capturedStageIndex]?.id ?? 'S1')
       return { ...prev, [storageKey]: synced }
     })
   }, [activeModeStageId, capturedStageIndex, stages])
@@ -1658,7 +1701,7 @@ export default function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return
       const target = event.target as HTMLElement | null
-      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+      if (target?.closest('input, textarea, select, [contenteditable="true"], .text-marker-editing')) return
       const key = event.key.toLowerCase()
       if (key === 'z') {
         event.preventDefault()
@@ -1682,15 +1725,24 @@ export default function App() {
   useEffect(() => {
     const onBackspace = (event: KeyboardEvent) => {
       if (event.key !== 'Backspace') return
+      // 原位文字编辑期间，Backspace 始终只允许编辑文字，
+      // 不进入绘图对象删除快捷键；不能只依赖事件 target，Leaflet 可能替换节点。
+      if (textEditing) return
       const target = event.target as HTMLElement | null
-      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+      const active = document.activeElement as HTMLElement | null
+      const inEditablePath = event.composedPath().some((node) =>
+        node instanceof HTMLElement && (node.isContentEditable || node.classList.contains('text-marker-editing')),
+      )
+      if (target?.closest('input, textarea, select, [contenteditable="true"], .text-marker-editing')
+        || active?.closest('input, textarea, select, [contenteditable="true"], .text-marker-editing')
+        || inEditablePath) return
       if (deleteSelCount <= 0) return
       event.preventDefault()
       handleDeleteSelected()
     }
     document.addEventListener('keydown', onBackspace)
     return () => document.removeEventListener('keydown', onBackspace)
-  }, [deleteSelCount, handleDeleteSelected])
+  }, [deleteSelCount, handleDeleteSelected, textEditing])
 
   // 自动持久化（v14：载具队伍 + 行动指令 V2 + 干员独立任务；旧版本由 storage 统一迁移）
   useEffect(() => {
@@ -1784,13 +1836,14 @@ export default function App() {
       // “据点与防线”总开关联动三个子图层。
       if (key === 'points') {
         next.layers.pointsLabels = value
+        next.layers.pointAnnotations = value
         next.layers.pointsCapture = value
         next.layers.pointsFrontline = value
       }
       // 父项关闭后仍允许直接开启任一子项；开启子项时同步恢复父图层。
       if (
         value &&
-        (key === 'pointsLabels' || key === 'pointsCapture' || key === 'pointsFrontline')
+        (key === 'pointsLabels' || key === 'pointAnnotations' || key === 'pointsCapture' || key === 'pointsFrontline')
       ) {
         next.layers.points = true
       }
@@ -2861,12 +2914,34 @@ export default function App() {
         )
         nextRoutes = syncRouteTargetPosition(nextRoutes, 'operator', operator.uid, point)
       }
-      updateMap(mapId, (s) => ({
-        ...s,
-        operators: { ...operatorsBucketOf(s), [view]: nextOperators },
-        routes: { ...routesBucketOf(s), [view]: nextRoutes },
-        skillActions: nextSkillActions,
-      }))
+      updateMap(mapId, (s) => {
+        const nextState: MapState = {
+          ...s,
+          operators: { ...operatorsBucketOf(s), [view]: nextOperators },
+          routes: { ...routesBucketOf(s), [view]: nextRoutes },
+          skillActions: nextSkillActions,
+        }
+        // 单兵的自定义名称是 UID 级别的编组标识，应跨阶段/回合保持；
+        // 干员身份字段（operatorId/cls）仍只属于当前桶，不能在这里传播。
+        const namesByUid = new Map(nextOperators.map((operator) => [operator.uid, operator.name]))
+        const store = s.tacticalBuckets
+        if (store) {
+          nextState.tacticalBuckets = {
+            ...store,
+            buckets: Object.fromEntries(Object.entries(store.buckets).map(([key, bucket]) => [key, {
+              ...bucket,
+              operators: {
+                ...bucket.operators,
+                [view]: (bucket.operators?.[view] ?? []).map((operator) => {
+                  const name = namesByUid.get(operator.uid)
+                  return name == null || name === operator.name ? operator : { ...operator, name }
+                }),
+              },
+            }])),
+          }
+        }
+        return nextState
+      })
       const after: MapStateSnapshot = {
         ...before,
         operators: { ...before.operators, [view]: nextOperators },
@@ -3476,7 +3551,7 @@ export default function App() {
     setMapId(targetMapId)
     setView(payload.view === 'defense' ? 'defense' : 'attack')
     if (activeBucket) {
-      const targetModeMap = (targetProfile.id === 'attack-defense' ? targetProfile.platformMaps?.[targetPlatform] : targetProfile.maps)?.[targetMapId] ?? targetProfile.maps[targetMapId]
+      const targetModeMap = modeMapsForPlatform(targetProfile, targetPlatform)[targetMapId]
       setProgress((current) => ({ ...current, [targetContextKey]: Math.max(0, targetModeMap?.stages.findIndex((stage) => stage.id === activeBucket.stageId) ?? 0) }))
       setModeStageSelection((current) => ({ ...current, [targetContextKey]: activeBucket.stageId }))
     }
@@ -3780,9 +3855,28 @@ export default function App() {
       const before = cloneState(cur)
       updateMap(mapId, (s) => {
         const bucket = teamsBucketOf(s)
+        const nextTeams = mutator(bucket[view] ?? [])
+        const namesByUid = new Map(nextTeams.map((team) => [team.uid, team.name]))
+        const store = s.tacticalBuckets
+        const tacticalBuckets = store
+          ? {
+            ...store,
+            buckets: Object.fromEntries(Object.entries(store.buckets).map(([key, tacticalBucket]) => [key, {
+              ...tacticalBucket,
+              teams: {
+                ...tacticalBucket.teams,
+                [view]: (tacticalBucket.teams?.[view] ?? []).map((team) => {
+                  const name = namesByUid.get(team.uid)
+                  return name == null || name === team.name ? team : { ...team, name }
+                }),
+              },
+            }])),
+          }
+          : undefined
         return {
           ...s,
-          teams: { ...bucket, [view]: mutator(bucket[view] ?? []) },
+          teams: { ...bucket, [view]: nextTeams },
+          ...(tacticalBuckets ? { tacticalBuckets } : {}),
         }
       })
       const after: MapStateSnapshot = {
@@ -3955,17 +4049,7 @@ export default function App() {
         const idx = stages.findIndex((s) => s.id === stageId)
         if (idx >= 0) {
           if (idx !== capturedStageIndex) {
-            updateMap(mapId, (state) => {
-              const fromStage = stages[capturedStageIndex]?.id ?? 'S1'
-              const toStage = stages[idx]?.id ?? fromStage
-              const source = snapshotTacticalBucket(state, fromStage, wargameOf(state).round)
-              const buckets = { ...(state.tacticalBuckets?.buckets ?? {}), [source.key]: source }
-              const targetKey = tacticalBucketKey(toStage, wargameOf(state).round)
-              const target = buckets[targetKey] ?? snapshotTacticalBucket(createEmptyMapState(), toStage, wargameOf(state).round)
-              buckets[targetKey] = target
-              const staged = normalizeObjectivesForStageChange({ ...state, tacticalBuckets: { activeKey: source.key, buckets } }, stages, capturedStageIndex, idx)
-              return applyTacticalBucket({ ...staged, tacticalBuckets: { activeKey: target.key, buckets } }, target)
-            })
+            updateMap(mapId, (state) => switchClassicStage(state, stages, capturedStageIndex, idx), stages[idx]?.id)
           }
           setProgress((prev) => ({ ...prev, [activeTacticalContextKey]: idx }))
         }
@@ -3996,7 +4080,8 @@ export default function App() {
     const stageIndex = stages.findIndex((stage) => stage.id === stageId)
     if (stageIndex < 0) return
     if (stageIndex !== capturedStageIndex) {
-      updateMap(mapId, (state) => normalizeObjectivesForStageChange(state, stages, capturedStageIndex, stageIndex))
+      // 与 C（地图点据点）一致的切桶逻辑：切桶 + 名单兜底 + 据点归属同步
+      updateMap(mapId, (state) => switchClassicStage(state, stages, capturedStageIndex, stageIndex), stages[stageIndex]?.id)
     }
     setProgress((current) => ({ ...current, [activeTacticalContextKey]: stageIndex }))
     setSelectedPoint(null)
@@ -4004,7 +4089,14 @@ export default function App() {
   }, [activeModeMap, activeTacticalContextKey, capturedStageIndex, handleSelectModeStage, mapId, stages, updateMap])
 
   return (
-    <div className={`app platform-${device.platform} ${device.mobileLayout ? 'mobile-layout' : 'desktop-layout'} ${ui.paletteOpen ? 'left-panel-open' : 'left-panel-closed'} ${isCinematicMapOnly ? 'cinematic-map-only' : ''} ${isCinematicCompassDemo ? 'cinematic-compass-demo' : ''} ${isCinematicLayerTour ? 'cinematic-layer-tour' : ''} ${isCinematicObjectiveStates ? 'cinematic-objective-states' : ''} ${isCinematicActionSequence ? `cinematic-action-sequence cinematic-action-${cinematicActionState} cinematic-focus-${cinematicActionFocus}` : ''} ${isCinematicCompletePlan ? `cinematic-complete-plan cinematic-complete-${cinematicCompletePlanFocus}` : ''} ${isCinematicRoundCopy ? `cinematic-round-copy-demo cinematic-round-copy-${cinematicRoundCopyFocus}` : ''} ${isCinematicRefreshSidebar ? `cinematic-refresh-sidebar cinematic-refresh-${cinematicRefreshState}` : ''} ${isCinematicBattleCompare ? `cinematic-battle-${cinematicDemoStage?.toLowerCase()}` : ''} ${isCinematicC1Highlight ? `cinematic-c1-${cinematicDemoStage?.toLowerCase()}` : ''}`} style={{ '--left-panel-width': `${ui.leftPanelWidth}px` } as CSSProperties}>
+    <div className={`app platform-${device.platform} ${device.mobileLayout ? 'mobile-layout' : 'desktop-layout'} ${ui.paletteOpen ? 'left-panel-open' : 'left-panel-closed'} ${isCinematicMapOnly ? 'cinematic-map-only' : ''} ${isCinematicCompassDemo ? 'cinematic-compass-demo' : ''} ${isCinematicLayerTour ? 'cinematic-layer-tour' : ''} ${isCinematicObjectiveStates ? 'cinematic-objective-states' : ''} ${isCinematicActionSequence ? `cinematic-action-sequence cinematic-action-${cinematicActionState} cinematic-focus-${cinematicActionFocus}` : ''} ${isCinematicCompletePlan ? `cinematic-complete-plan cinematic-complete-${cinematicCompletePlanFocus}` : ''} ${isCinematicRoundCopy ? `cinematic-round-copy-demo cinematic-round-copy-${cinematicRoundCopyFocus}` : ''} ${isCinematicRefreshSidebar ? `cinematic-refresh-sidebar cinematic-refresh-${cinematicRefreshState}` : ''} ${isCinematicBattleCompare ? `cinematic-battle-${cinematicDemoStage?.toLowerCase()}` : ''} ${isCinematicC1Highlight ? `cinematic-c1-${cinematicDemoStage?.toLowerCase()}` : ''}`} style={{
+      '--left-panel-width': `${ui.leftPanelWidth}px`,
+      '--mobile-map-marker-scale': ui.mapMarkerScale,
+      // 载具部署入口沿用 PC 组图的相对几何；44px 透明热区本身不缩放。
+      '--mobile-spawn-link-left': `${54.6 * ui.mapMarkerScale}px`,
+      '--mobile-spawn-connector-left': `${22 + 21 * ui.mapMarkerScale}px`,
+      '--mobile-spawn-connector-width': `${17.64 * ui.mapMarkerScale}px`,
+    } as CSSProperties}>
       {(isCinematicActionSequence || isCinematicRoundCopy) && cinematicActionCursor ? <span className="cinematic-action-cursor" style={{ left: cinematicActionCursor.x, top: cinematicActionCursor.y }} /> : null}
       <Toolbar
         mapId={mapId}
@@ -4025,7 +4117,7 @@ export default function App() {
         view={view}
         onView={setView}
         tool={tool}
-        onTool={setTool}
+        onTool={handleToolChange}
         draw={ui.draw}
         onDrawChange={(draw) => setUi((u) => ({ ...u, draw }))}
         dirty={tool !== 'pan'}
@@ -4055,6 +4147,8 @@ export default function App() {
           vehicleRefreshAvailable={(activeOfficialModeMap?.vehicleRefreshRules.length ?? 0) > 0}
           propVis={ui.propVis}
           onPropVisChange={handlePropVisChange}
+          mapMarkerScale={ui.mapMarkerScale}
+          onMapMarkerScaleChange={(mapMarkerScale) => setUi((current) => ({ ...current, mapMarkerScale }))}
           sections={ui.sections}
           onSectionChange={(key, v, group) =>
             setUi((u) => {
@@ -4117,7 +4211,8 @@ export default function App() {
           modeStageId={activeModeStageId}
           view={view}
           tool={tool}
-          onTool={setTool}
+          onTool={handleToolChange}
+          onTextEditingChange={setTextEditing}
           state={state}
           fieldSupports={fieldSupports}
           onMoveFieldSupport={handleMoveFieldSupport}
@@ -4217,6 +4312,7 @@ export default function App() {
           capturedStageIndex={pointPanelStageIndex}
           view={view}
           selectedName={selectedPoint?.point.name ?? null}
+          selectedStageId={selectedPoint?.stageId ?? null}
           open={ui.panelOpen}
           onToggle={() => setUi((u) => ({ ...u, panelOpen: !u.panelOpen }))}
           onSelectStage={handleSelectPointPanelStage}
